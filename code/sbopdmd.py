@@ -124,10 +124,11 @@ class SparseBOPDMDOperator(BOPDMDOperator):
         self._eps_stall = eps_stall
         self._verbose = verbose
         self._feature_tol = feature_tol
+        self._unconverged_features = None
 
         # Set the parameters of Levenberg-Marquardt.
+        self._init_lambda = init_lambda
         self._lev_marq_params = {}
-        self._lev_marq_params["init_lambda"] = init_lambda
         self._lev_marq_params["maxlam"] = maxlam
         self._lev_marq_params["lamup"] = lamup
         self._lev_marq_params["use_optdmd_eigs"] = use_optdmd_eigs
@@ -141,13 +142,16 @@ class SparseBOPDMDOperator(BOPDMDOperator):
         else:
             self._mode_opt_params = mode_opt_params
 
+        self._obj_history = []
+        self._err_history = []
+
         # Set the parameters of get_global_modes.
         if global_mode_params is None:
             self._global_mode_params = {}
         else:
             self._global_mode_params = global_mode_params
 
-    def _compute_B(self, B0, alpha, H, t, Phi, amp_lim=None):
+    def _compute_B(self, B0, alpha, H, t, Phi):
         """
         Use accelerated prox-gradient to update B for the current alpha.
         """
@@ -155,7 +159,16 @@ class SparseBOPDMDOperator(BOPDMDOperator):
 
         # Get the indices at which to apply sparsity.
         index_local = np.ones(len(B0), dtype=bool)
-        index_local[self._index_global] = False
+
+        if self._index_global is not None:
+            if self._index_global == "auto":
+                index_global = self._get_global_modes(
+                    B0, **self._global_mode_params
+                )
+            else:
+                index_global = self._index_global.copy()
+
+            index_local[index_global] = False
 
         if self._SR3_step > 0.0:
             # Apply Sparse Relaxed Regularized Regression (SR3).
@@ -172,9 +185,6 @@ class SparseBOPDMDOperator(BOPDMDOperator):
 
             if self._apply_debias:
                 B_updated = support_lstsq(S=B_updated, A=A, B=H)
-
-                if self._verbose:
-                    print("De-biasing step applied.")
 
         else:
             # Apply proximal gradient directly to the B matrix (FISTA).
@@ -197,7 +207,12 @@ class SparseBOPDMDOperator(BOPDMDOperator):
                 **self._mode_opt_params,
             )
 
-        if self._verbose:
+        # Save the objective and error history.
+        self._obj_history.append(obj_hist)
+        self._err_history.append(err_hist)
+
+        # Plot the progress of the B update.
+        if self._verbose and len(self._obj_history) <= 3:
             if self._SR3_step > 0.0:
                 print("SR3 Results:")
             else:
@@ -215,37 +230,53 @@ class SparseBOPDMDOperator(BOPDMDOperator):
             plt.tight_layout()
             plt.show()
 
-        # Apply amplitude limits if provided.
-        if amp_lim is not None:
-            b = np.sqrt(np.sum(np.abs(B_updated) ** 2, axis=1))
-            B_updated[b > amp_lim] = np.finfo(float).eps
-
         return B_updated
 
-    def _compute_alpha_levmarq(
+    def _compute_levmarq(
         self,
+        alpha,
         B,
-        alpha_0,
         H,
+        init_lambda,
         t,
         Phi,
         dPhi,
-        init_lambda,
         maxlam,
         lamup,
         use_optdmd_eigs,
     ):
         """
-        Use Levenberg-Marquardt to step alpha for the current B.
+        Use Levenberg-Marquardt to step alpha and its corresponding B matrix.
         """
+
+        def compute_residual(alpha, B):
+            """
+            Helper function that, when given the current alpha (eigenvalues)
+            and B matrix (modes), computes and returns the residual.
+            Distinguishes between the compressed and uncompressed cases.
+            """
+            if self._use_proj:
+                B_proj = B.dot(self._proj_basis.conj())
+                return H_proj - Phi(alpha, t).dot(B_proj)
+
+            return H - Phi(alpha, t).dot(B)
+
+        # Set the damping parameter.
+        _lambda = init_lambda
+
         # Define M, IS, and IA.
-        M, IS = H.shape
-        IA = len(alpha_0)
+        if self._use_proj:
+            H_proj = H.dot(self._proj_basis.conj())
+            M, IS = H_proj.shape
+        else:
+            M, IS = H.shape
+
+        IA = len(alpha)
 
         # Compute the SVD of Phi(alpha, t) if using OptDMD approximation.
         if use_optdmd_eigs:
             U = self._compute_irank_svd(
-                Phi(alpha_0, t),
+                Phi(alpha, t),
                 tolrank=M * np.finfo(float).eps,
             )[0]
 
@@ -257,18 +288,27 @@ class SparseBOPDMDOperator(BOPDMDOperator):
         # Initialize the current objective and residual.
         # Note: Here, we only use the objective to compare the quality of
         # different alpha results, hence we omit the regularizer portion.
-        residual = H - Phi(alpha_0, t).dot(B)
+        residual = compute_residual(alpha, B)
         objective = np.linalg.norm(residual, "fro") ** 2
 
         for i in range(IA):
             # Build the Jacobian matrix by looping over all alpha indices.
             if use_optdmd_eigs:
-                dphi_temp = dPhi(alpha_0, t, i)
+                dphi_temp = dPhi(alpha, t, i)
                 uut_dphi = csr_matrix(U @ csr_matrix(U.conj().T @ dphi_temp))
-                djac_approx = (dphi_temp - uut_dphi) @ B
+                if self._use_proj:
+                    B_proj = B.dot(self._proj_basis.conj())
+                    djac_approx = (dphi_temp - uut_dphi) @ B_proj
+                else:
+                    djac_approx = (dphi_temp - uut_dphi) @ B
                 djac_matrix[:, i] = djac_approx.ravel(order="F")
+            elif self._use_proj:
+                B_proj = B.dot(self._proj_basis.conj())
+                djac_matrix[:, i] = (
+                    dPhi(alpha, t, i).dot(B_proj).ravel(order="F")
+                )
             else:
-                djac_matrix[:, i] = dPhi(alpha_0, t, i).dot(B).ravel(order="F")
+                djac_matrix[:, i] = dPhi(alpha, t, i).dot(B).ravel(order="F")
 
             # Scale for the Levenberg-Marquardt algorithm.
             scales[i] = min(np.linalg.norm(djac_matrix[:, i]), 1)
@@ -276,19 +316,18 @@ class SparseBOPDMDOperator(BOPDMDOperator):
 
         # Loop to determine lambda (the step-size parameter).
         rhs_temp = residual.ravel(order="F")[:, None]
-        q_out, djac_out, j_pvt = qr(
-            djac_matrix, mode="economic", pivoting=True
-        )
+        q_out, djac_out, j_pvt = qr(djac_matrix, mode="economic", pivoting=True)
         if not self._varpro_flag:
             # The original python, which is a "mistake" that makes bopdmd
             # behave more like exact DMD but also keeps the solver from
             # wandering into bad states.
             ij_pvt = np.arange(IA)
             ij_pvt = ij_pvt[j_pvt]
-        elif self._varpro_flag:
+        else:  # self._varpro_flag
             # Use the true variable projection.
             ij_pvt = np.zeros(IA, dtype=int)
             ij_pvt[j_pvt] = np.arange(IA, dtype=int)
+
         rjac[:IA] = np.triu(djac_out[:IA])
         rhs_top = q_out.conj().T.dot(rhs_temp)
         scales_pvt = scales[j_pvt[:IA]]
@@ -307,23 +346,65 @@ class SparseBOPDMDOperator(BOPDMDOperator):
             delta = delta[ij_pvt]
 
             # Compute the updated alpha vector.
-            alpha_updated = alpha_0.ravel() + delta.ravel()
+            alpha_updated = alpha.ravel() + delta.ravel()
             alpha_updated = self._push_eigenvalues(alpha_updated)
 
-            return alpha_updated
+            return alpha_updated, delta
 
-        for j in range(maxlam + 1):
-            # Scale lambda up every iteration.
-            lam = init_lambda * (lamup**j)
+        # Take a step using our initial step size init_lambda.
+        alpha_new, delta = step(_lambda)
 
-            # Take a step using our step size lam.
-            alpha_new = step(lam)
-            residual_new = H - Phi(alpha_new, t).dot(B)
+        # Compute the updated (sparse, full-dimensional) B matrix.
+        B_new = np.copy(B)
+        B_new[:, self._unconverged_features] = self._compute_B(
+            B[:, self._unconverged_features],
+            alpha_new,
+            H[:, self._unconverged_features],
+            t,
+            Phi,
+        )
+
+        # Compute the corresponding residual for the new update.
+        residual_new = compute_residual(alpha_new, B_new)
+        objective_new = np.linalg.norm(residual_new, "fro") ** 2
+
+        # Check actual improvement vs predicted improvement.
+        actual_improvement = objective - objective_new
+        pred_improvement = (_lambda**2) * np.linalg.multi_dot(
+            [delta.conj().T, np.diag(scales_pvt**2), delta]
+        ).real
+        pred_improvement -= np.linalg.multi_dot(
+            [delta.conj().T, djac_matrix.conj().T, rhs_temp]
+        )[0].real
+        improvement_ratio = actual_improvement / pred_improvement
+
+        if objective_new < objective:
+            # Rescale lambda based on the improvement ratio.
+            _lambda *= max(1 / 3, 1 - (2 * improvement_ratio - 1) ** 3)
+            return alpha_new, B_new, _lambda
+
+        # Increase lambda until something works.
+        for _ in range(maxlam):
+            _lambda *= lamup
+            alpha_new, _ = step(_lambda)
+            B_new = np.copy(B)
+            B_new[:, self._unconverged_features] = self._compute_B(
+                B[:, self._unconverged_features],
+                alpha_new,
+                H[:, self._unconverged_features],
+                t,
+                Phi,
+            )
+            residual_new = compute_residual(alpha_new, B_new)
             objective_new = np.linalg.norm(residual_new, "fro") ** 2
 
             # If the objective improved, terminate.
             if objective_new < objective:
-                return alpha_new
+                return alpha_new, B_new, _lambda
+
+            # If failure, remove the recorded B update information.
+            del self._obj_history[-1]
+            del self._err_history[-1]
 
         # Terminate if no appropriate step length was found...
         if self._verbose:
@@ -332,14 +413,14 @@ class SparseBOPDMDOperator(BOPDMDOperator):
                 "Consider increasing maxlam or changing lamup.\n"
             )
 
-        return alpha_0
+        return alpha, B, _lambda
 
-    def _variable_projection(self, H, t, init_alpha, Phi, dPhi, amp_limit):
+    def _variable_projection(self, H, t, init_alpha, Phi, dPhi):
         """
         Variable projection routine for multivariate data with regularization.
         """
 
-        def get_objective(B, alpha):
+        def get_objective(alpha, B):
             """
             Compute the current objective.
             """
@@ -347,22 +428,13 @@ class SparseBOPDMDOperator(BOPDMDOperator):
             objective = 0.5 * np.linalg.norm(residual, "fro") ** 2
             objective += self._mode_regularizer(B)
 
-            # Scale by the number of features.
-            objective /= N
-
             return objective
 
-        # Set additional Levenberg-Marquardt parameters.
+        # Set the Levenberg-Marquardt parameters.
+        _lambda = self._init_lambda
         self._lev_marq_params["t"] = t
         self._lev_marq_params["Phi"] = Phi
         self._lev_marq_params["dPhi"] = dPhi
-
-        # Record the original data set size (number of features).
-        N = H.shape[1]
-
-        # Set the projected data if requested.
-        if self._use_proj:
-            H_proj = H.dot(self._proj_basis.conj())
 
         # Initialize alpha.
         alpha = self._push_eigenvalues(init_alpha)
@@ -370,16 +442,9 @@ class SparseBOPDMDOperator(BOPDMDOperator):
         # Initialize B.
         if self._init_B is None:
             B = np.linalg.lstsq(Phi(alpha, t), H, rcond=None)[0]
+            B = self._compute_B(B, alpha, H, t, Phi)
         else:
             B = np.copy(self._init_B)
-
-        # Pre-compute the estimated global modes based on B0.
-        if self._index_global == "auto":
-            self._index_global = self._get_global_modes(
-                B, **self._global_mode_params
-            )
-            if self._verbose:
-                print(f"Setting index_global to {self._index_global}")
 
         # Initialize storage for objective values and error.
         # Note: "error" refers to differences in iterations.
@@ -387,42 +452,25 @@ class SparseBOPDMDOperator(BOPDMDOperator):
         all_err = np.empty(self._maxiter)
 
         # Initialize termination flags.
-        unconverged_features = np.ones(N, dtype=bool)
+        self._unconverged_features = np.ones(H.shape[1], dtype=bool)
         converged = False
         stalled = False
 
         for itr in range(self._maxiter):
 
-            # Get the new optimal matrix B.
-            B_new = np.copy(B)
-            B_new[:, unconverged_features] = self._compute_B(
-                B[:, unconverged_features],
-                alpha,
-                H[:, unconverged_features],
-                t,
-                Phi,
-                amp_limit,
-            )
-
             # Take a Levenberg-Marquardt step to update alpha.
-            if self._use_proj:
-                B_new_proj = B_new.dot(self._proj_basis.conj())
-                alpha_new = self._compute_alpha_levmarq(
-                    B_new_proj, alpha, H_proj, **self._lev_marq_params
-                )
-            else:
-                alpha_new = self._compute_alpha_levmarq(
-                    B_new, alpha, H, **self._lev_marq_params
-                )
+            alpha_new, B_new, _lambda = self._compute_levmarq(
+                alpha, B, H, _lambda, **self._lev_marq_params
+            )
 
             # Get new objective and error values.
             err_alpha = np.linalg.norm(alpha - alpha_new)
             err_B = np.linalg.norm(B - B_new)
-            all_obj[itr] = get_objective(B_new, alpha_new)
+            all_obj[itr] = get_objective(alpha_new, B_new)
             all_err[itr] = err_alpha + err_B
 
             # Get feature indices at which very little change occured.
-            unconverged_features = (
+            self._unconverged_features = (
                 np.linalg.norm(B - B_new, axis=0) ** 2 > self._feature_tol
             )
 
@@ -481,16 +529,12 @@ class SparseBOPDMDOperator(BOPDMDOperator):
         system matrix, full system matrix, and whether or not convergence
         of the variable projection routine was reached.
         """
-
-        # An amplitude limit is available but not implemented.
-        b_lim = None
         B, alpha, converged = self._variable_projection(
             H,
             t,
             init_alpha,
             self._exp_function,
             self._exp_function_deriv,
-            b_lim,
         )
 
         # Save the modes, eigenvalues, and amplitudes.
@@ -548,6 +592,10 @@ class SparseBOPDMD(BOPDMD):
         less than or equal to zero), proximal gradient is applied directly to
         the modes and SR3 is not used. By default, SR3 is used.
     :type SR3_step: float
+    :param apply_debias: Whether or not to apply a de-biasing step following
+        the application of the sparse mode update. This entails re-computing
+        least squares on the optimal support computed by SR3.
+    :type apply_debias: bool
     :param init_B: Initial guess for the amplitude-scaled DMD modes.
         Defaults to using the relationship H = Phi(init_alpha)init_B.
     :type init_B: numpy.ndarray
