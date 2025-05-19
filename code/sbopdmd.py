@@ -286,10 +286,9 @@ class SparseBOPDMDOperator(BOPDMDOperator):
         scales = np.zeros(IA)
 
         # Initialize the current objective and residual.
-        # Note: Here, we only use the objective to compare the quality of
-        # different alpha results, hence we omit the regularizer portion.
         residual = compute_residual(alpha, B)
         objective = np.linalg.norm(residual, "fro") ** 2
+        objective += self._mode_regularizer(B)
 
         for i in range(IA):
             # Build the Jacobian matrix by looping over all alpha indices.
@@ -352,7 +351,7 @@ class SparseBOPDMDOperator(BOPDMDOperator):
             return alpha_updated, delta
 
         # Take a step using our initial step size init_lambda.
-        alpha_new, delta = step(_lambda)
+        alpha_new, _ = step(_lambda)
 
         # Compute the updated (sparse, full-dimensional) B matrix.
         B_new = np.copy(B)
@@ -367,20 +366,20 @@ class SparseBOPDMDOperator(BOPDMDOperator):
         # Compute the corresponding residual for the new update.
         residual_new = compute_residual(alpha_new, B_new)
         objective_new = np.linalg.norm(residual_new, "fro") ** 2
-
-        # Check actual improvement vs predicted improvement.
-        actual_improvement = objective - objective_new
-        pred_improvement = (_lambda**2) * np.linalg.multi_dot(
-            [delta.conj().T, np.diag(scales_pvt**2), delta]
-        ).real
-        pred_improvement -= np.linalg.multi_dot(
-            [delta.conj().T, djac_matrix.conj().T, rhs_temp]
-        )[0].real
-        improvement_ratio = actual_improvement / pred_improvement
+        objective_new += self._mode_regularizer(B_new)
 
         if objective_new < objective:
-            # Rescale lambda based on the improvement ratio.
-            _lambda *= max(1 / 3, 1 - (2 * improvement_ratio - 1) ** 3)
+            # # Rescale lambda based on the improvement ratio.
+            # actual_improvement = objective - objective_new
+            # pred_improvement = (_lambda**2) * np.linalg.multi_dot(
+            #     [delta.conj().T, np.diag(scales_pvt**2), delta]
+            # ).real
+            # pred_improvement -= np.linalg.multi_dot(
+            #     [delta.conj().T, djac_matrix.conj().T, rhs_temp]
+            # )[0].real
+            # improvement_ratio = actual_improvement / pred_improvement
+            # _lambda *= max(1 / 3, 1 - (2 * improvement_ratio - 1) ** 3)
+            _lambda /= 3
             return alpha_new, B_new, _lambda
 
         # Increase lambda until something works.
@@ -397,6 +396,7 @@ class SparseBOPDMDOperator(BOPDMDOperator):
             )
             residual_new = compute_residual(alpha_new, B_new)
             objective_new = np.linalg.norm(residual_new, "fro") ** 2
+            objective_new += self._mode_regularizer(B_new)
 
             # If the objective improved, terminate.
             if objective_new < objective:
